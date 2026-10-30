@@ -12,6 +12,7 @@ from catalog import PRODUCTS
 # so the app keeps working when older model names are retired.
 # Override by adding GEMINI_MODEL = "..." to your secrets.
 DEFAULT_MODEL = "gemini-flash-latest"
+FALLBACK_MODELS = ["gemini-flash-lite-latest", "gemini-2.5-flash"]
 
 MAX_IMAGE_SIDE = 1024     # resize photos before sending (faster + cheaper)
 HISTORY_LIMIT = 12        # how many past chat messages the AI sees
@@ -110,20 +111,40 @@ def ask_stylist(messages):
             )
         )
 
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                temperature=0.8,
-            ),
-        )
-        return response.text or "I couldn't put together a look this time — please try again."
-    except Exception as e:
+    # Fail fast instead of silently retrying for minutes.
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            timeout=60_000,  # milliseconds
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        temperature=0.8,
+    )
+
+    # Try the chosen model, then backups if it's busy or unavailable.
+    models_to_try = [model] + [m for m in FALLBACK_MODELS if m != model]
+    last_error = None
+    for name in models_to_try:
+        try:
+            response = client.models.generate_content(
+                model=name, contents=contents, config=config,
+            )
+            if response.text:
+                return response.text
+        except Exception as e:
+            last_error = e
+            print(f"[Aurene AI] {name} failed: {type(e).__name__}: {e}", flush=True)
+
+    detail = f"{type(last_error).__name__}: {str(last_error)[:200]}" if last_error else "empty reply"
+    if last_error and ("429" in str(last_error) or "RESOURCE_EXHAUSTED" in str(last_error)):
         return (
-            "I couldn't reach the styling studio just now. Please try again "
-            f"in a moment.\n\n_Details: {type(e).__name__}: "
-            f"{str(e)[:200]}_"
+            "So many style requests right now! ✨ Please wait a minute and "
+            "try again."
         )
+    return (
+        "I couldn't reach the styling studio just now. Please try again "
+        f"in a moment.\n\n_Details: {detail}_"
+    )
